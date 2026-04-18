@@ -1,0 +1,16 @@
+#this doc is a reminder how to set up virtual python environment because I forget everytime
+
+#in command line type
+
+python3 -m venv .venv
+
+#now the environment is created, it still has to be activated
+
+source .venv/bin/activate
+
+#you will know its active when (.venv) appears in parenthases at the start of the command prompt
+
+
+
+
+#unrelated reminder. Use pip to install 3rd party python packages
