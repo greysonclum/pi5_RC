@@ -1,29 +1,63 @@
-from gpiozero import PWMOutputDevice, DigitalOutputDevice, AngularServo
+import smbus2
 import sys
 import termios
 import tty
 import time
 
-# Define GPIO pins (BCM mode)
-PWM_PIN = 17  # PWM input for motor speed control
-DIR_PIN = 18  # Direction input for motor (HIGH for forward, LOW for reverse)
-SERVO_PIN = 22  # PWM output for servo control
+# PCA9685 I2C configuration
+PCA9685_ADDRESS = 0x40  # Default PCA9685 I2C address (can be 0x40-0x7F with address pins)
+I2C_BUS = 1  # I2C bus number on Raspberry Pi 5
 
-# Set up devices
-pwm = PWMOutputDevice(PWM_PIN, frequency=1000)  # 1kHz frequency
-dir_pin = DigitalOutputDevice(DIR_PIN)
-servo = AngularServo(SERVO_PIN, min_angle=-45, max_angle=45, min_pulse_width=0.0005, max_pulse_width=0.0025)
+SERVO_CHANNEL = 0  # PCA9685 channel 0 for servo (0-15)
+SERVO_FREQUENCY = 50  # Common servo frequency in Hz
+MIN_PULSE_WIDTH = 0.0005  # 500 microseconds
+MAX_PULSE_WIDTH = 0.0025  # 2500 microseconds
 
-def move_forward():
-    dir_pin.on()  # Set direction HIGH
-    pwm.value = 1.0  # Full speed (100% duty cycle)
+# PCA9685 register addresses
+MODE1 = 0x00
+PRESCALE = 0xFE
+LED0_ON_L = 0x06
+LED0_ON_H = 0x07
+LED0_OFF_L = 0x08
+LED0_OFF_H = 0x09
 
-def move_reverse():
-    dir_pin.off()  # Set direction LOW
-    pwm.value = 1.0  # Full speed (100% duty cycle)
+# Calculate min/max pulse values for 50Hz frequency
+# At 50Hz, each cycle is 20ms. With 4096 steps, each step is ~4.88us
+PULSE_MIN = int(MIN_PULSE_WIDTH * 1000000 / (1000000 / SERVO_FREQUENCY) * 4096)
+PULSE_MAX = int(MAX_PULSE_WIDTH * 1000000 / (1000000 / SERVO_FREQUENCY) * 4096)
 
-def stop_motor():
-    pwm.value = 0.0  # Stop motor by setting PWM to 0
+# Initialize I2C bus
+bus = smbus2.SMBus(I2C_BUS)
+servo_angle = 0
+
+
+def init_pca9685():
+    """Initialize PCA9685 PWM driver."""
+    # Set MODE1 to sleep and configure
+    bus.write_byte_data(PCA9685_ADDRESS, MODE1, 0x10)
+    time.sleep(0.01)
+    
+    # Set prescale for 50Hz frequency
+    # prescale = round(25MHz / (4096 * 50Hz)) - 1 = 121
+    prescale = 121
+    bus.write_byte_data(PCA9685_ADDRESS, PRESCALE, prescale)
+    
+    # Wake up the device
+    bus.write_byte_data(PCA9685_ADDRESS, MODE1, 0x00)
+    time.sleep(0.01)
+
+
+def set_pwm(channel, on_value, off_value):
+    """Set PWM values for a specific channel."""
+    on_l = on_value & 0xFF
+    on_h = (on_value >> 8) & 0xFF
+    off_l = off_value & 0xFF
+    off_h = (off_value >> 8) & 0xFF
+    
+    bus.write_byte_data(PCA9685_ADDRESS, LED0_ON_L + channel * 4, on_l)
+    bus.write_byte_data(PCA9685_ADDRESS, LED0_ON_H + channel * 4, on_h)
+    bus.write_byte_data(PCA9685_ADDRESS, LED0_OFF_L + channel * 4, off_l)
+    bus.write_byte_data(PCA9685_ADDRESS, LED0_OFF_H + channel * 4, off_h)
 
 
 def get_key():
@@ -42,9 +76,33 @@ def get_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
+def angle_to_pulse(angle):
+    """Convert servo angle to PCA9685 pulse value."""
+    angle = max(-45, min(45, angle))
+    # Linear interpolation between min and max pulse
+    pulse = PULSE_MIN + (angle + 45) / 90 * (PULSE_MAX - PULSE_MIN)
+    return int(pulse)
+
+
+def set_servo_angle(target_angle, step_delay=0.02):
+    global servo_angle
+    target_angle = max(-45, min(45, target_angle))
+    if servo_angle == target_angle:
+        return target_angle
+
+    step = 1 if target_angle > servo_angle else -1
+    for angle in range(int(servo_angle), int(target_angle) + step, step):
+        pulse = angle_to_pulse(angle)
+        set_pwm(SERVO_CHANNEL, 0, pulse)
+        servo_angle = angle
+        time.sleep(step_delay)
+
+    return target_angle
+
+
 def sweep_servo():
     angle = 0
-    servo.angle = angle
+    angle = set_servo_angle(angle)
     print("Use up/down arrow keys to change servo angle. Press q to quit.")
     print(f"Servo angle: {angle}°")
     while True:
@@ -54,40 +112,30 @@ def sweep_servo():
                 print("LIMIT REACHED")
             else:
                 angle += 1
-                servo.angle = angle
+                angle = set_servo_angle(angle)
                 print(f"Servo angle: {angle}°")
         elif key == 'B':  # Down arrow
             if angle <= -45:
                 print("LIMIT REACHED")
             else:
                 angle -= 1
-                servo.angle = angle
+                angle = set_servo_angle(angle)
                 print(f"Servo angle: {angle}°")
         elif key in ('q', 'Q'):
             break
 
 try:
-    # Move forward for 3 seconds
-    #move_forward()
-    #time.sleep(3)
+    # Initialize PCA9685
+    init_pca9685()
     
-    # Stop for 2 seconds
-    #stop_motor()
-    #time.sleep(2)
+    # Set servo to center position
+    center_pulse = (PULSE_MIN + PULSE_MAX) // 2
+    set_pwm(SERVO_CHANNEL, 0, center_pulse)
     
-    # Move reverse for 3 seconds
-    #move_reverse()
-    #time.sleep(3)
-    
-    # Stop
-    stop_motor()
-    
-    # Sweep servo 10° one way and 10° the other
+    # Sweep servo
     sweep_servo()
 
 finally:
-    # Clean up devices
-    pwm.close()
-    dir_pin.close()
-    servo.close()
+    # Clean up I2C bus
+    bus.close()
 
